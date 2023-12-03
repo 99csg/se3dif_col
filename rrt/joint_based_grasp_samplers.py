@@ -13,7 +13,7 @@ from pytorch3d import transforms
 
 
 
-class Q_based_Grasp_AnnealedLD():
+class Joint_based_Grasp_AnnealedLD():
     def __init__(self, model, device='cpu', batch=10, dim =3, k_steps=1,
                  T=200, T_fit=5, deterministic=False):
 
@@ -30,11 +30,9 @@ class Q_based_Grasp_AnnealedLD():
         self.deterministic = deterministic
 
         ## planning related params
-        self.trans = np.array([0.4,0.4,-0.05])
+        self.trans = np.array([0.4,0.3,-0.1])
         self.w_ob = 5.
         self.w_e = 1. 
-        self.w_sm = 2.
-        self.w_tb = 5.
 
         ## Langevin MCMC related 
         self.q_indices = torch.tensor(torch.tensor([[1,2,3], [0,3,2], [3,0,1], [2,1,0]], dtype=torch.long))
@@ -49,8 +47,8 @@ class Q_based_Grasp_AnnealedLD():
         return np.sqrt((sigma ** (2 * t) - 1.) / (2. * np.log(sigma)))
 
     
-    def _step(self, env, quat,pre_quat, t, noise_off=True, obj_cost=None,tab_cost=None):
-
+    def _step(self, env, angles=None, pre_joint=None, t=0, noise_off=False, obj_cost=None, tab_cost=None):
+        
         ## Phase
         noise_std = .5
         eps = 1e-3
@@ -65,136 +63,112 @@ class Q_based_Grasp_AnnealedLD():
         if noise_off:
             c_lr = 0.003
 
-        if pre_quat is not None:
-            smooth_cost = env.check_smoothness(quat, pre_quat)
-        else:
-            smooth_cost = torch.zeros(10,1)
+        # mapping : angles -> H -> e 
+        jac_t, jac_r = env.get_jacobian(angles) # (3,7), (3,7)
+        a,b = torch.tensor(jac_t[-1]), torch.tensor(jac_r[-1])
+        jac_combined = torch.cat((a,b), axis=0) # (6,7)
+        U,S,V = np.linalg.svd(jac_combined)
+        pseudo_determinant = np.prod(S) # element multiplication - sigma 6 
+        print(S)
+        print(pseudo_determinant)
 
-        mat=self.quat_to_SE3(quaternions=quat)
-        H0 = SO3_R3(R=mat[:,:3,:3],t=mat[:,:3,-1]) # (10,4,4)
+        _,ee_state = env.get_xyz_state() # (7,1)
+        pos,quat = ee_state[:3],ee_state[3:]
+        renew_quat = torch.cat((quat, pos),dim=0)
+        ten_quat = renew_quat.unsqueeze(0).repeat(10,1)
+        H=self.quat_to_SE3(quaternions=ten_quat) # (10,4,4)
+
+        H0 = SO3_R3(R=H[:,:3,:3],t=H[:,:3,-1]) # (10,4,4)
         h0 = H0.log_map() # (10,6)
         h0_in = h0.requires_grad_(True) #h0_in = h0.detach().requires_grad_(True) # (10,6)
         H_in = SO3_R3().exp_map(h0_in).to_matrix() # (10,4,4)
         t_in = phase*torch.ones_like(H_in[:,0,0]) # (10,1,1)
         e = self.model(H_in, t_in) # (10,1)
+        dE_dh = torch.autograd.grad(e.sum(), h0_in)[0] # (10,6)
 
-        total_cost = self.w_e*e.sum()+self.w_ob*obj_cost.sum()+self.w_sm*smooth_cost.sum()+self.w_tb*tab_cost.sum()
-        print(e.sum(),obj_cost.sum(),smooth_cost.sum(),tab_cost.sum())
-        q_grad = torch.autograd.grad(total_cost, quat)[0] # 10 energy sum 
+        energy_angle_gradient = torch.mm(dE_dh,jac_combined)
+        
+        if noise_off:
+            noise = torch.zeros_like(torch.tensor(angles))
+        else:
+            noise = torch.randn_like(torch.tensor(angles))*noise_std
+        
         #print(f"before MCMC q grad:{q_grad[0]} ")
-        q_new = self.propose(quat, q_grad, reject=False, var_dt=True, noise_off=noise_off)
-        #print(f"new q:{q_new[0]} ")
+        new_angle = torch.tensor(angles) + 0.5*c_lr*energy_angle_gradient+0.01*np.sqrt(c_lr)*noise
 
-        # q_new = quat-np.sqrt(c_lr)*q_grad    
-        # print(f"new q:{q_new[0]} ")
-        return q_new
+
+        print(angles[0],"\n",0.5*c_lr*energy_angle_gradient[0],"\n",0.01*np.sqrt(c_lr)*noise[0])
+
+        return new_angle
 
     def sample(self, save_path=False, batch=None, P=None, mesh=None):
 
         if batch is None:
             batch = self.batch
         #H0 = SO3_R3().sample(batch).to(self.device, torch.float32)
-        #random_quat = self.generate_rn_quat(batch_size=batch)
+        #q_list=env.H_to_q(H0)
 
         mesh, P = self.mesh_P_only_downscale_shift(mesh=mesh,P=P)
 
         # test env init
-        env = KukaVisualization()  #env = pandaVisualization()
-        _ ,ee_quat = env.go_to_init_state() # robot init quat
+        env = KukaVisualization() 
+        _, ee_quat=env.go_to_init_state()
         env.test_pos_orn_init(quat=ee_quat) # visualize - blue 
         ob_list=env.init_trg_obs(mesh=mesh, pc=P) # visualize - object 
         
         # step 0 
-        quat = ee_quat.repeat(10,1).requires_grad_(True)
+        init_joint_states = [math.pi/2, math.pi/4, 0, -math.pi/2, 0, math.pi/4,0]
+        
+
         mesh,P=self.mesh_P_only_upscale_deshift(mesh, P)
-        obj_cost = env.check_obj_collision(ob_list=ob_list,quat=quat,index=0)
-        tab_cost = env.check_table_collision(quat=quat)
+        obj_cost = env.angle_based_check_obj_collision(ob_list=None,angles=init_joint_states,index=0)
+        tab_cost = torch.tensor([0.0])
+        new_joint = self._step(env, angles=init_joint_states, pre_joint=None, t=0, noise_off=False, obj_cost=obj_cost, tab_cost=tab_cost)
+        mesh, P = self.mesh_P_only_downscale_shift(mesh=mesh,P=P)
+        env.joint_based_move(new_joint[0])
 
-        qquat = quat.clone()
-        qquat[...,4:7]=quat[...,4:7]*5.
-        new_quat = self._step(env, quat=qquat, pre_quat=None, t=0, noise_off=False, obj_cost=obj_cost, tab_cost=tab_cost)
-        #env.test_pos_orn_init(quat=new_quat[0]) 
-        quat_, mesh, P = self.downscale_shift(new_quat,mesh,P)
-        env.quat_based_move(quat_, 0)
+        # if save_path:
+        #     trj_q = quat[None,...]
 
-        # test
-        env.test_pos_orn(quat=quat_, index=0)
-
-        # Langevin MCMC 
-        if save_path:
-            trj_q = quat[None,...]
-            trj_q = torch.cat((trj_q, quat[None,:]),0) # (2,10,7)
-
-        for t in range(1,self.T+1):
-            up_quat, mesh, P = self.upscale_deshift(quat_,mesh,P)
-            #print(f"before model:{quat[0]}\n")
+        for t in range(0,self.T):
+            mesh, P = self.mesh_P_only_upscale_deshift(mesh,P)
             
-            obj_cost = env.check_obj_collision(ob_list=ob_list,quat=up_quat,index=0)
-            total_coll=env.check_collision_info(ob_list=ob_list)
-            print(f"{total_coll}-collision occurs")
+            obj_cost = env.angle_based_check_obj_collision(ob_list=None,angles=None,index=0)
             self.w_ob = self.w_ob_scheduling(t)
-            tab_cost = env.check_table_collision(quat=quat)
+            new_joint = self._step(env, angles=new_joint, pre_joint=None, t=0, noise_off=False, obj_cost=obj_cost, tab_cost=tab_cost)
+        
+            mesh, P = self.mesh_P_only_downscale_shift(mesh,P)
+            env.joint_based_move(new_joint[0])
 
-            new_quat_ = self._step(env, quat=up_quat, pre_quat=trj_q[-2,:,:], t=t, noise_off=False, obj_cost=obj_cost, tab_cost=tab_cost)
-            
-            down_quat, mesh, P = self.downscale_shift(new_quat_,mesh,P)
-            env.quat_based_move(down_quat, 0)
-
-            # check pseudo determinant 
-            jac_t, jac_r = env.get_jacobian(current_joint=quat)
-            a,b = torch.tensor(jac_t[-1]), torch.tensor(jac_r[-1])
-            jac_combined = torch.cat((a,b), axis=0) # (6,7)
-            U,S,V = np.linalg.svd(jac_combined)
-            pseudo_determinant = np.prod(S) # element multiplication - sigma 6 
-            print(S)
-            print(pseudo_determinant)
-
-            # test
-            env.test_pos_orn(quat=down_quat, index=0)
             
             print(f"{t}-th Langevin Dynamics completed\n")
-            if save_path:
-                trj_q = torch.cat((trj_q, down_quat[None,:]), 0) # (n, 10, 7)
-        
-
-            quat_ = down_quat
+            # if save_path:
+            #     trj_q = torch.cat((trj_q, down_quat[None,:]), 0)
 
 
-        for t in range(1,self.T_fit+1):
-            up_quat, mesh, P = self.upscale_deshift(quat_,mesh,P)
-            #print(f"before model:{quat[0]}\n")
+           
 
-            # collision check 
-            obj_cost = env.check_obj_collision(ob_list=ob_list,quat=up_quat,index=0)
-            self.w_ob = 0.01
-            total_coll=env.check_collision_info(ob_list=ob_list)
-            print(f"{total_coll}-collision occurs")
-            tab_cost = env.check_table_collision(quat=quat)
 
-            new_quat_ = self._step(env, quat=up_quat, pre_quat=trj_q[-2,:,:], t=t, noise_off=True, obj_cost=obj_cost, tab_cost=tab_cost)
+        for t in range(0,self.T_fit):
+            mesh, P = self.mesh_P_only_upscale_deshift(mesh,P)
             
-            down_quat, mesh, P = self.downscale_shift(new_quat_,mesh,P)
-            env.quat_based_move(down_quat, 0)
-
-            # test
-            env.test_pos_orn(quat=down_quat, index=0)
+            obj_cost = env.angle_based_check_obj_collision(ob_list=None,angles=None,index=0)
+            self.w_ob = self.w_ob_scheduling(t)
+            new_joint = self._step(env, angles=new_joint, pre_joint=None, t=0, noise_off=True, obj_cost=obj_cost, tab_cost=tab_cost)
+        
+            mesh, P = self.mesh_P_only_downscale_shift(mesh,P)
+            env.joint_based_move(new_joint[0])
 
             print(f"{t}-th deterministic sampling completed\n")
-            if save_path:
-                trj_q = torch.cat((trj_q, down_quat[None,:]), 0)
 
-            quat_ = down_quat
-        time.sleep(10)
-        horizon = self.T+self.T_fit
+
+        # horizon = self.T+self.T_fit
         
-        # # move to init pos 
-        # _ ,ee_quat = env.go_to_init_state() # robot init quat
-
         # # postprocessing for smooth trajectory 
-        # smooth_path = self.generate_smooth_trajectory(trj_q,horizon) # (12,10,7)
+        # smooth_path = self.generate_smooth_trajectory(trj_q,horizon) # (60,7)
 
         # # visualize trajectory 
-        # for i in range(1,len(smooth_path)):
+        # for i in range(len(smooth_path)):
         #     env.quat_based_move(smooth_path, i)
         # trj_q = smooth_path 
         if save_path:
@@ -348,73 +322,10 @@ class Q_based_Grasp_AnnealedLD():
     def normalize_quaternion(self,q):
         return transforms.standardize_quaternion(q/torch.norm(q, dim=-1, keepdim=True))
 
-    def propose(self, T, grad, reject = False, var_dt = True, noise_off = True):
-        #T, grad = T.detach(), grad.detach() # (Nt, 7), (Nt, 7)
-
-        nat_grad = grad.clone() # (Nt, 7)
-        L = T[...,self.q_indices] * self.q_factor # (Nt, 4, 3)  # LSO(3)
-        if var_dt is True or reject is True:
-            lie_grad = torch.empty_like(grad[...,:6]) # (Nt, 6) # (v, \omg)  # h
-            lie_grad[..., :3] = transforms.quaternion_apply(transforms.quaternion_invert(T[...,:4]), point = grad[...,4:]) # (Nt, 3), Translation part
-            lie_grad[..., 3:] = torch.einsum('...ia,...i->...a', L, grad[...,:4]) # (Nt, 3), Rotation part
-        Ginv = (torch.eye(4, dtype=T.dtype, device=T.device) - torch.einsum('...i,...j->...ij', T[...,:4], T[...,:4]))/4  # (Nt, 4, 4)
-        nat_grad[..., :4] = self.rot_trans*(torch.einsum('...ij,...j->...i', Ginv, grad[...,:4])) # (Nt, 7)
-        if var_dt is True:
-            dt = torch.min(3 / (lie_grad.abs().sum(dim=-1) + 1e-5), torch.tensor(1., device=grad.device, dtype=grad.dtype)).unsqueeze(-1) # (Nt,1)
-            dt = dt*self.dt                                # (Nt,1)
-        else:                                                                                          
-            dt = self.dt
-        std_R = torch.sqrt(2*dt) * self.std_theta      # (Nt,1) or (1,)
-        std_X = torch.sqrt(2*dt) * self.std_X          # (Nt,1) or (1,)
-
-        
-        noise_R_lie = torch.randn_like(T[...,:3]) # (Nt, 3) # rotation
-        noise_X_lie = torch.randn_like(noise_R_lie) # (Nt, 3) # translation
-        noise_q = torch.einsum('...ij,...j', L, noise_R_lie) # (Nt, 4)
-        # noise_X = transforms.quaternion_apply(quaternion = T[...,:4], point = noise_X_lie) # (Nt, 3) # Unnecessary due to rotation invariance of normal distribution
-        noise_X = noise_X_lie  # (Nt, 3)
-
-        if noise_off:
-            dt = 0.01*dt
-            dT = -(nat_grad*dt)
-        else:
-            dT = -(nat_grad*dt) + torch.cat([noise_q*std_R, noise_X*std_X], dim=-1) # (Nt, 7)
-        #print(f"nat_grad:{nat_grad[0]}, \ndt:{dt[0]}, \nstd_R:{std_R[0]}, \nstd_X:{std_X[0]}\n")
-        #print(f"gradient term:{nat_grad[0]*dt[0]},\nnoise term:{torch.cat([noise_q*std_R, noise_X*std_X], dim=-1)[0]}\n")
-        T_prop = T + dT # (Nt, 7)
-
-        #print(f"after MCMC q gradient:{dT[0]}")
-        T_prop[...,:4] = self.normalize_quaternion(T_prop[...,:4])
-
-        return T_prop
-
     def w_ob_scheduling(self, t):
         w_ob = max(5-((5-0.1)*t/(0.8*self.w_ob)),0.1)
         return w_ob
 
-    def slerp(self, q0, q1, t):
-        """Spherical linear interpolation."""
-        dot = torch.dot(q0, q1)
-        dot = torch.clamp(dot, -1.0, 1.0)
-        theta = torch.acos(dot) * t
-        q1_rel = q1 - q0 * dot
-        q1_rel /= torch.norm(q1_rel)
-
-        return torch.cos(theta) * q0 + torch.sin(theta) * q1_rel
-
-    def generate_smooth_trajectory(self, waypoints, num_smooth_points):
-        waypoints = torch.tensor(waypoints, dtype=torch.float32)
-        smooth_trajectory = torch.zeros((num_smooth_points, 7))
-
-        for i in range(1, num_smooth_points):
-            t = i / (num_smooth_points - 1)
-            q0 = waypoints[i,0, :4]  # (4)
-            q1 = waypoints[i-1,0, :4] # (4)
-
-            smooth_trajectory[i, :4] = self.slerp(q0, q1, t)
-            smooth_trajectory[i, 4:] = waypoints[i,0, 4:]  * (1 - t) + waypoints[i-1,0, 4:]  * t
-
-        return smooth_trajectory
     
 if __name__ == '__main__':
     pass
